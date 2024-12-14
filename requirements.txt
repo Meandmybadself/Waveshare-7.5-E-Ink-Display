@@ -1,3 +1,7 @@
 requests
 Pillow
 python-dotenv
+spidev
+gpiozero
+lgpio
+RPi.GPIO

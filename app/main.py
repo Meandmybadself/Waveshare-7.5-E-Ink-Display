@@ -2,218 +2,232 @@ import sys
 import os
 import textwrap
 from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
-
-# Setting up directories
-picdir = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'pic')
-libdir = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib')
-if os.path.exists(libdir):
-    sys.path.append(libdir)
-
 import requests
 import json
 from datetime import datetime
-from waveshare_epd import epd7in5_V2
 import time
 from PIL import Image, ImageDraw, ImageFont
 import traceback
 import logging
+import RPi.GPIO as GPIO
 
+# Initialize logging with more detailed format
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
-logging.basicConfig(level=logging.DEBUG)
+# Load environment variables
+load_dotenv()
+logger.debug("Environment variables loaded")
 
-def get_bus_arrival(api_key, bus_stop_code):
-    url = "https://datamall2.mytransport.sg/ltaodataservice/v3/BusArrival?BusStopCode=" + bus_stop_code
-    headers = {
-        'AccountKey': api_key,
-        'accept': 'application/json'
-    }
-    
-    response = requests.get(url, headers=headers)
-    
-    if response.status_code == 200:
-        data = response.json()
-        services = data.get("Services", [])
-        bus_info = []
-        
-        for service in services:
-            service_no = service["ServiceNo"]
-            arrival_times = []
-            for bus in ["NextBus", "NextBus2", "NextBus3"]:
-                if service.get(bus):
-                    eta = service[bus]["EstimatedArrival"]
-                    if eta:
-                        eta_time = datetime.strptime(eta, "%Y-%m-%dT%H:%M:%S%z")
-                        time_diff = (eta_time - datetime.now(eta_time.tzinfo)).total_seconds() / 60
-                        arrival_times.append(round(time_diff))
-            if arrival_times:
-                bus_info.append((service_no, arrival_times))
-        return bus_info
-    else:
-        logging.error("Error: Unable to fetch data. Status code: " + str(response.status_code))
-        return []
+# Configuration and Setup
+#----------------------------------------
+# Set up directory paths for resources
+picdir = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'pic')
+libdir = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib')
 
-def get_train_disruptions():
-    api_key = os.getenv('API_KEY')
-    url = "https://datamall2.mytransport.sg/ltaodataservice/TrainServiceAlerts"
-    headers = {
-        'AccountKey': api_key,
-        'accept': 'application/json'
-    }
+logger.debug(f"Picture directory: {picdir}")
+logger.debug(f"Library directory: {libdir}")
 
-    print("Fetching train disruptions...")
-    print(f"URL: {url}")
-    print(f"Headers: {headers}")
+# Add lib directory to system path if it exists
+if os.path.exists(libdir):
+    sys.path.append(libdir)
+    logger.debug(f"Added {libdir} to system path")
+else:
+    logger.warning(f"Library directory {libdir} does not exist")
 
+def check_spi_access():
+    """Check if SPI devices are accessible – if they arent, run raspi-config to enable SPI"""
+    spi_devices = ['/dev/spidev0.0', '/dev/spidev0.1']
+    for device in spi_devices:
+        if not os.access(device, os.R_OK | os.W_OK):
+            logger.error(f"No read/write access to {device}")
+            return False
+    return True
+
+# Add this before initializing the display
+if not check_spi_access():
+    logger.error("SPI access check failed. Please check raspi-config and group membership.")
+    sys.exit(1)
+
+logger.debug("Importing E-Ink display module")
+from waveshare_epd import epd7in5_V2
+logger.debug("E-Ink display module imported")
+
+# Load environment variables for aircraft tracking
+LATITUDE = os.getenv('LATITUDE')
+LONGITUDE = os.getenv('LONGITUDE')
+RADIUS = os.getenv('RADIUS')
+
+logger.debug(f"Configured tracking parameters - LAT: {LATITUDE}, LON: {LONGITUDE}, RADIUS: {RADIUS}")
+
+# API Functions
+#----------------------------------------
+def get_closest_aircraft():
+    """
+    Fetch data about the closest aircraft from the ADSB API
+    Returns: Dictionary with aircraft data or None if request fails
+    """
+    logger.debug("Attempting to fetch closest aircraft data")
     try:
-        response = requests.get(url, headers=headers)
-        print(f"Response status code: {response.status_code}")
-        print(f"Response content: {response.text}")
-
-        response.raise_for_status()  # Raises an HTTPError for bad responses
-        data = response.json()
-
-        print("Parsed JSON data:")
-        print(json.dumps(data, indent=2))
-
-        disruptions = []
-        content = ''
-
-        if 'value' in data:
-            print("'value' key found in data")
-            if 'AffectedSegments' in data['value'] and data['value']['AffectedSegments']:
-                print("Processing AffectedSegments...")
-                for segment in data['value']['AffectedSegments']:
-                    disruption = {
-                        'Line': segment.get('Line', ''),
-                        'Direction': segment.get('Direction', ''),
-                        'Stations': segment.get('Stations', '').split(',')
-                    }
-                    disruptions.append(disruption)
-                    print(f"Added disruption: {disruption}")
-
-            if 'Message' in data['value'] and data['value']['Message']:
-                print("Processing Message...")
-                content = data['value']['Message'][0].get('Content', '')
-                print(f"Content: {content}")
-
-        if not disruptions and not content:
-            print("No disruptions found")
-            return "No Disruptions Today!"
+        url = f'https://api.adsb.lol/v2/closest/{LATITUDE}/{LONGITUDE}/{RADIUS}'
+        logger.debug(f"Making API request to: {url}")
+        
+        response = requests.get(url)
+        logger.debug(f"API response status code: {response.status_code}")
+        
+        if response.status_code == 200:
+            data = response.json()
+            logger.debug(f"Received aircraft data: {json.dumps(data, indent=2)}")
+            
+            # Check if we have any aircraft in the response
+            if data.get('ac') and len(data['ac']) > 0:
+                # Return the first aircraft in the array
+                return data['ac'][0]
+            else:
+                logger.warning("No aircraft found in response")
+                return None
+                
         else:
-            result = {
-                'disruptions': disruptions,
-                'content': content
-            }
-            print(f"Returning result: {result}")
-            return result
-
-    except requests.RequestException as e:
-        print(f"Error fetching train disruptions: {e}")
+            logger.error(f"API request failed with status code: {response.status_code}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"API request failed with exception: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
         return None
 
-def display_bus_arrivals(epd, draw, font, bus_info_A, bus_info_B):
-    draw.rectangle((0, 0, epd.width, epd.height), fill=255)  # Clear the display
-    y = 20  # Initial Y position for text
-    column_offset = epd.width // 2  # Divide the screen into two columns
-    
-    draw.text((120, y),"Downstairs", font=font, fill=0)
+def update_display(aircraft_data):
+    """
+    Update the E-Ink display with aircraft information
+    Args:
+        aircraft_data: Dictionary containing aircraft information
+    """
+    epd = None
+    logger.debug("Starting display update")
+    try:
+        # Initialize display
+        logger.debug("Initializing E-Ink display")
+        epd = epd7in5_V2.EPD()
+        
+        # Initialize with timeout check
+        init_timeout = time.time() + 30  # 30 second timeout
+        epd.init()
+        while epd.digital_read(epd.busy_pin) == 1:
+            if time.time() > init_timeout:
+                raise TimeoutError("Display initialization timed out")
+            time.sleep(0.1)
+        
+        # Clear with timeout check
+        logger.debug("Clearing display")
+        clear_timeout = time.time() + 30
+        epd.Clear()
+        while epd.digital_read(epd.busy_pin) == 1:
+            if time.time() > clear_timeout:
+                raise TimeoutError("Display clear timed out")
+            time.sleep(0.1)
+        
+        # Create canvas
+        image = Image.new('1', (epd.width, epd.height), 255)
+        draw = ImageDraw.Draw(image)
+        
+        # Set up fonts with fallback
+        try:
+            font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', 24)
+            small_font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 18)
+        except Exception as e:
+            logger.warning(f"Font loading failed: {str(e)}, using default font")
+            font = ImageFont.load_default()
+            small_font = ImageFont.load_default()
 
-    # Display for Bus Stop A (left column)
-    for service_no, arrival_times in bus_info_A:
-        draw.rectangle((20, y+50, 180, y + 110), fill=0)
-        draw.text((50, y + 58), service_no, font=font, fill=255)
-        times_text = " | ".join(map(str, arrival_times))
-        draw.text((220, y + 55), times_text, font=font, fill=0)
-        y += 70
-    
-    y = 20  # Reset Y position for the right column
+        # Extract and format aircraft data
+        flight = aircraft_data.get('flight', 'N/A').strip()
+        aircraft_type = aircraft_data.get('t', 'N/A')
+        altitude = aircraft_data.get('alt_baro', 'N/A')
+        speed = aircraft_data.get('gs', 'N/A')
+        registration = aircraft_data.get('r', 'N/A')
+        distance = aircraft_data.get('dst', 'N/A')
+        
+        text_lines = [
+            f"Flight: {flight}",
+            f"Registration: {registration}",
+            f"Aircraft Type: {aircraft_type}",
+            f"Altitude: {altitude} ft",
+            f"Ground Speed: {speed} knots",
+            f"Distance: {distance} NM"
+        ]
 
-    draw.text((120+column_offset, y),"Opposite", font=font, fill=0)
+        # Draw text
+        y_position = 30
+        for line in text_lines:
+            draw.text((30, y_position), line, font=font, fill=0)
+            y_position += 40
 
-    # Display for Bus Stop B (right column)
-    for service_no, arrival_times in bus_info_B:
-        draw.rectangle((20 + column_offset, y+50, 180 + column_offset, y + 110), fill=0)
-        draw.text((50 + column_offset, y + 58), service_no, font=font, fill=255)
-        times_text = " | ".join(map(str, arrival_times))
-        draw.text((220 + column_offset, y + 55), times_text, font=font, fill=0)
-        y += 70
-    
-    epd.display(epd.getbuffer(Himage))
+        # Add timestamp
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        draw.text((30, y_position + 20), f"Last Updated: {timestamp}", font=small_font, fill=0)
 
-def display_train_disruption(epd, draw, font, train_info):
-    # Clear the image
-    Himage = Image.new('1', (epd.width, epd.height), 255)
-    draw = ImageDraw.Draw(Himage)
+        # Update display with timeout
+        logger.debug("Updating display with new image")
+        display_timeout = time.time() + 30
+        epd.display(epd.getbuffer(image))
+        while epd.digital_read(epd.busy_pin) == 1:
+            if time.time() > display_timeout:
+                raise TimeoutError("Display update timed out")
+            time.sleep(0.1)
+        
+        logger.debug("Display update completed successfully")
+        
+    except Exception as e:
+        logger.error(f"Display update failed: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+    finally:
+        if epd is not None:
+            logger.debug("Putting display to sleep")
+            try:
+                epd.sleep()
+            except Exception as e:
+                logger.error(f"Error putting display to sleep: {str(e)}")
 
-    # Draw title
-    draw.text((10, 10), "Train Disruptions", font=font, fill=0)
+def wait_for_display_ready(epd, timeout_seconds=10):
+    """Helper function to wait for display to be ready with timeout"""
+    timeout = time.time() + timeout_seconds
+    while epd.digital_read(epd.busy_pin) == 1:
+        if time.time() > timeout:
+            raise TimeoutError(f"Display busy timeout after {timeout_seconds} seconds")
+        time.sleep(0.1)
 
-    if train_info == "No Disruptions Today!":
-        draw.text((10, 60), train_info, font=font, fill=0)
-    elif train_info:
-        y_offset = 60
-        for disruption in train_info['disruptions']:
-            draw.text((10, y_offset), f"Line: {disruption['Line']}", font=font, fill=0)
-            y_offset += 40
-            draw.text((10, y_offset), f"Direction: {disruption['Direction']}", font=font, fill=0)
-            y_offset += 40
-            stations = ", ".join(disruption['Stations'])
-            draw.text((10, y_offset), f"Stations: {stations}", font=font, fill=0)
-            y_offset += 60
-
-        # Display content (message) if available
-        if train_info['content']:
-            draw.text((10, y_offset), "Message:", font=font, fill=0)
-            y_offset += 40
-            # Wrap text to fit display width
-            wrapped_text = textwrap.wrap(train_info['content'], width=40)  # Adjust width as needed
-            for line in wrapped_text:
-                draw.text((10, y_offset), line, font=font, fill=0)
-                y_offset += 30
-
-    # Display the image on the E-Ink display
-    epd.display(epd.getbuffer(Himage))
-
+# Main Execution
+#----------------------------------------
+logger.info("Starting main execution loop")
 try:
-    logging.info("Bus Arrival Display on E-Ink")
-    epd = epd7in5_V2.EPD()
-    
-    logging.info("Init and Clear")
-    epd.init()
-    epd.Clear()
-
-  # Using a larger and bold font
-    font48 = ImageFont.truetype(os.path.join(picdir, 'OpenSans-Bold.ttf'), 32)
-    Himage = Image.new('1', (epd.width, epd.height), 255)
-    draw = ImageDraw.Draw(Himage)
-    
-    api_key = os.getenv('API_KEY')
-    bus_stop_code_A = os.getenv('BUS_STOP_CODE_A')
-    bus_stop_code_B = os.getenv('BUS_STOP_CODE_B')
-
-    
     while True:
-        #Display Bus Arrival
-        bus_info_A = get_bus_arrival(api_key, bus_stop_code_A)
-        bus_info_B = get_bus_arrival(api_key, bus_stop_code_B)
-        display_bus_arrivals(epd, draw, font48, bus_info_A, bus_info_B)
-        time.sleep(30)  # Refresh every 30 seconds
-
-        # Display train disruptions
-        # Uncomment to display train info
-        # train_info = get_train_disruptions()
-        # display_train_disruption(epd, draw, font48, train_info)
-        # time.sleep(15)  # Display train info for 30 seconds
-
-except IOError as e:
-    logging.error(e)
-    
+        logger.debug("Starting new update cycle")
+        # closest_aircraft = get_closest_aircraft() // This works.
+        # Use mock data for testing
+        closest_aircraft = {
+            'flight': 'TEST123',
+            'r': 'N12345',
+            't': 'B738',
+            'alt_baro': 35000,
+            'gs': 450,
+            'dst': 12.5
+        }
+        if closest_aircraft:
+            logger.debug("Retrieved aircraft data, updating display")
+            update_display(closest_aircraft)
+        else:
+            logger.warning("No aircraft data received")
+        logger.debug("Waiting 30 seconds before next update")
+        time.sleep(30)
 except KeyboardInterrupt:
-    logging.info("Exiting...")
-    epd.Clear()
-    epd7in5_V2.epdconfig.module_exit(cleanup=True)
-    exit()
-
+    logger.info("Program terminated by user")
+except Exception as e:
+    logger.error(f"Main loop error: {str(e)}")
+    logger.error(f"Traceback: {traceback.format_exc()}")
+finally:
+    logger.debug("Cleaning up GPIO")
+    GPIO.cleanup()
